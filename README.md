@@ -68,7 +68,7 @@ Use the multi-page grid to organize sound effects, intro music, and transitions.
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/sk4ur/claket-tauri.git
+    git clone https://github.com/aera128/claket-tauri.git
    cd claket-tauri
    ```
 
@@ -103,5 +103,5 @@ Contributions are welcome! If you have ideas for streamer integrations or audio 
 ---
 
 <div align="center">
-  Built with ❤️ for the streaming community by <a href="https://github.com/sk4ur">sk4ur</a>
+  Built with ❤️ for the streaming community by <a href="https://github.com/aera128">sk4ur</a>
 </div>
