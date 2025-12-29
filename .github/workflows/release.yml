@@ -4,7 +4,7 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: # <--- C'est cette ligne qui permet le déclenchement manuel
+  workflow_dispatch:
 
 jobs:
   publish-tauri:
@@ -33,9 +33,11 @@ jobs:
       - name: install bun
         uses: oven-sh/setup-bun@v1
 
-      - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      # CHANGEMENT ICI : Passage en nightly pour toutes les plateformes
+      - name: install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
         with:
+          # Les cibles MacOS sont nécessaires pour le build universel
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: install dependencies (ubuntu only)
@@ -51,7 +53,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__ # Utilise la version du tauri.conf.json si pas de tag
+          tagName: v__VERSION__
           releaseName: "Claket Soundboard v__VERSION__"
           releaseBody: "See RELEASE_NOTES_TEMP.md for details."
           releaseDraft: true
