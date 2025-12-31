@@ -57,7 +57,7 @@ export const useAudioStore = defineStore("audio", {
     pageNames: [] as string[],
     dragPosition: null as { page: number, x: number, y: number } | null,
     lastUpdateTimestamp: new Map<number, number>(),
-    reducedMotion: false,
+    reducedMotion: true,
     accentColor: "Default",
     masterLevels: { peak: 0, rms: 0 },
     isVUMeterExpanded: false,

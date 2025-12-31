@@ -22,7 +22,7 @@ withDefaults(defineProps<AuroraBackgroundProps>(), {
         $props.className,
       )"
     >
-      <div class="fixed inset-0 overflow-hidden pointer-events-none z-0">
+      <div v-if="!store.reducedMotion" class="fixed inset-0 overflow-hidden pointer-events-none z-0">
         <div
           :class="cn(
             `
@@ -31,7 +31,7 @@ withDefaults(defineProps<AuroraBackgroundProps>(), {
             [background-image:var(--white-gradient),var(--aurora)] [background-size:300%,_200%] [background-position:50%_50%,50%_50%]
             after:[background-image:var(--white-gradient),var(--aurora)] after:[background-size:200%,_100%] after:[background-attachment:fixed]
             dark:[background-image:var(--dark-gradient),var(--aurora)] after:dark:[background-image:var(--dark-gradient),var(--aurora)]
-            ${!store.reducedMotion ? 'after:animate-aurora' : ''}
+            after:animate-aurora
             `,
             showRadialGradient && `[mask-image:radial-gradient(ellipse_at_100%_0%,black_10%,transparent_70%)]`,
           )"

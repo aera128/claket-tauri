@@ -135,6 +135,7 @@ const progressPercent = computed(() => {
         @click="handlePlay"
       >
         <GlowingEffect
+          v-if="!store.reducedMotion"
           :spread="40"
           :glow="button?.activeInstances && button.activeInstances > 0"
           :disabled="false"

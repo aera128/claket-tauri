@@ -164,9 +164,8 @@ impl MeterManager {
                 let mut master_peak = 0.0f32;
                 let mut master_rms = 0.0f32;
                 let mut has_any_active_sink = false;
-                let global_vol = *master_vol_ref.lock().unwrap();
 
-                {
+                let meters_snapshot = {
                     if let Ok(mut meters) = active_meters.lock() {
                         meters.retain(|(meter, sink)| {
                             if sink.empty() {
@@ -179,16 +178,27 @@ impl MeterManager {
                                 }
                             }
                         });
+                        
+                        if meters.is_empty() {
+                            None
+                        } else {
+                            Some(meters.iter().map(|(m, s)| (m.clone(), s.clone())).collect::<Vec<_>>())
+                        }
+                    } else {
+                        None
+                    }
+                };
 
-                        for (meter, sink) in meters.iter() {
-                            if let Ok(levels) = meter.lock() {
-                                if !sink.is_paused() {
-                                    let vol = levels.volume * global_vol;
-                                    master_peak = master_peak.max(levels.peak * vol);
-                                    master_rms = master_rms.max(levels.rms * vol);
-                                }
-                                has_any_active_sink = true;
+                if let Some(meters) = meters_snapshot {
+                    let global_vol = *master_vol_ref.lock().unwrap();
+                    for (meter, sink) in meters.iter() {
+                        if let Ok(levels) = meter.lock() {
+                            if !sink.is_paused() {
+                                let vol = levels.volume * global_vol;
+                                master_peak = master_peak.max(levels.peak * vol);
+                                master_rms = master_rms.max(levels.rms * vol);
                             }
+                            has_any_active_sink = true;
                         }
                     }
                 }
@@ -198,18 +208,20 @@ impl MeterManager {
                         peak: master_peak,
                         rms: master_rms,
                     });
+                    std::thread::sleep(Duration::from_millis(16));
                 } else {
                     let _ = app_handle.emit("master-level", MasterLevelEvent {
                         peak: 0.0,
                         rms: 0.0,
                     });
+                    std::thread::sleep(Duration::from_millis(250));
                 }
-
-                std::thread::sleep(Duration::from_millis(16));
             }
         });
     }
 }
+
+const CACHE_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024; // 5MB
 
 #[derive(Clone, Serialize)]
 struct AudioProgress {
@@ -225,7 +237,7 @@ struct AudioProgress {
 struct CachedSound {
     channels: u16,
     sample_rate: u32,
-    samples: Arc<Vec<f32>>,
+    samples: Option<Arc<Vec<f32>>>,
     duration: Duration,
 }
 
@@ -300,21 +312,45 @@ impl AudioState {
                 // Create new sink on the new device
                 if let Ok(new_sink) = Sink::try_new(handle) {
                     let new_sink = Arc::new(new_sink);
-                    let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (*data.samples).clone());
-                    let skipped_source = source_buffered.skip_duration(current_pos);
                     
-                    let levels = Arc::new(Mutex::new(LevelData {
-                        peak: 0.0,
-                        rms: 0.0,
-                        volume: *volume,
-                        last_update: Instant::now(),
-                    }));
-                    let metered_source = LevelMeter::new(skipped_source, levels.clone());
-                    
-                    self.meter_manager.add_meter(levels, Arc::clone(&new_sink));
-                    
-                    new_sink.set_volume(*volume * master_vol);
-                    new_sink.append(metered_source);
+                    if let Some(samples) = &data.samples {
+                        let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (**samples).clone());
+                        let skipped_source = source_buffered.skip_duration(current_pos);
+                        
+                        let levels = Arc::new(Mutex::new(LevelData {
+                            peak: 0.0,
+                            rms: 0.0,
+                            volume: *volume,
+                            last_update: Instant::now(),
+                        }));
+                        let metered_source = LevelMeter::new(skipped_source, levels.clone());
+                        
+                        self.meter_manager.add_meter(levels, Arc::clone(&new_sink));
+                        
+                        new_sink.set_volume(*volume * master_vol);
+                        new_sink.append(metered_source);
+                    } else {
+                        // Streaming for large files during migration
+                        if let Ok(file) = File::open(path) {
+                            let reader = BufReader::new(file);
+                            if let Ok(source) = Decoder::new(reader) {
+                                let skipped_source = source.skip_duration(current_pos).convert_samples::<f32>();
+                                
+                                let levels = Arc::new(Mutex::new(LevelData {
+                                    peak: 0.0,
+                                    rms: 0.0,
+                                    volume: *volume,
+                                    last_update: Instant::now(),
+                                }));
+                                let metered_source = LevelMeter::new(skipped_source, levels.clone());
+                                
+                                self.meter_manager.add_meter(levels, Arc::clone(&new_sink));
+                                
+                                new_sink.set_volume(*volume * master_vol);
+                                new_sink.append(metered_source);
+                            }
+                        }
+                    }
                     
                     if sink.is_paused() {
                         new_sink.pause();
@@ -332,16 +368,33 @@ impl AudioState {
 }
 
 #[tauri::command]
-pub fn list_audio_devices() -> Result<Vec<String>, String> {
+pub async fn list_audio_devices() -> Result<Vec<String>, String> {
     let host = cpal::default_host();
     let devices = host.output_devices().map_err(|e| e.to_string())?;
     let mut names: Vec<String> = devices.filter_map(|d| d.name().ok()).collect();
+    
+    names.retain(|name| {
+        let n = name.to_lowercase();
+        !n.starts_with("hw:") && 
+        !n.starts_with("plughw:") && 
+        !n.starts_with("dmix:") && 
+        !n.starts_with("dsnoop:") &&
+        !n.ends_with("rate") && 
+        !n.starts_with("speex") &&
+        !n.contains("surround") &&
+        !n.contains("upmix") &&
+        !n.contains("vdownmix")
+    });
+    
+    names.sort();
+    names.dedup();
+    
     names.insert(0, "Default".to_string());
     Ok(names)
 }
 
 #[tauri::command]
-pub fn set_audio_device(state: State<AudioState>, device_name: String) -> Result<(), String> {
+pub async fn set_audio_device(state: State<'_, AudioState>, device_name: String) -> Result<(), String> {
     let old_device = {
         let mut device_name_guard = state
             .current_device_name
@@ -367,7 +420,7 @@ pub fn set_audio_device(state: State<AudioState>, device_name: String) -> Result
 }
 
 #[tauri::command]
-pub fn update_master_volume(state: State<AudioState>, volume: f32) -> Result<(), String> {
+pub async fn update_master_volume(state: State<'_, AudioState>, volume: f32) -> Result<(), String> {
     let mut master_vol = state.master_volume.lock().unwrap();
     *master_vol = volume;
     
@@ -379,14 +432,16 @@ pub fn update_master_volume(state: State<AudioState>, volume: f32) -> Result<(),
 }
 
 #[tauri::command]
-pub fn preload_sound(state: State<AudioState>, path: String) -> Result<(), String> {
+pub async fn preload_sound(state: State<'_, AudioState>, path: String) -> Result<(), String> {
     let cache = Arc::clone(&state.cache);
     
     std::thread::spawn(move || {
         let mut cache_guard = cache.lock().unwrap();
         if !cache_guard.contains_key(&path) {
             if let Ok(file) = File::open(&path) {
+                let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
                 let reader = BufReader::new(file);
+                
                 if let Ok(source) = Decoder::new(reader) {
                     let duration = Probe::open(&path)
                         .ok()
@@ -396,11 +451,17 @@ pub fn preload_sound(state: State<AudioState>, path: String) -> Result<(), Strin
 
                     let channels = source.channels();
                     let sample_rate = source.sample_rate();
-                    let samples: Vec<f32> = source.convert_samples().collect();
+                    
+                    let samples = if file_size <= CACHE_THRESHOLD_BYTES {
+                        Some(Arc::new(source.convert_samples().collect()))
+                    } else {
+                        None
+                    };
+
                     cache_guard.insert(path, CachedSound {
                         channels,
                         sample_rate,
-                        samples: Arc::new(samples),
+                        samples,
                         duration,
                     });
                 }
@@ -411,9 +472,9 @@ pub fn preload_sound(state: State<AudioState>, path: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn play_sound(
+pub async fn play_sound(
     app: AppHandle,
-    state: State<AudioState>,
+    state: State<'_, AudioState>,
     id: String,
     path: String,
     name: String,
@@ -444,6 +505,7 @@ pub fn play_sound(
                 Some(cached.clone())
             } else {
                 if let Ok(file) = File::open(&path_clone) {
+                    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
                     let reader = BufReader::new(file);
                     if let Ok(source) = Decoder::new(reader) {
                         let duration = Probe::open(&path_clone)
@@ -454,11 +516,17 @@ pub fn play_sound(
 
                         let channels = source.channels();
                         let sample_rate = source.sample_rate();
-                        let samples: Vec<f32> = source.convert_samples().collect();
+                        
+                        let samples = if file_size <= CACHE_THRESHOLD_BYTES {
+                            Some(Arc::new(source.convert_samples().collect()))
+                        } else {
+                            None
+                        };
+
                         let cached = CachedSound {
                             channels,
                             sample_rate,
-                            samples: Arc::new(samples),
+                            samples,
                             duration,
                         };
                         cache_guard.insert(path_clone.clone(), cached.clone());
@@ -468,23 +536,34 @@ pub fn play_sound(
             }
         };
 
-                if let Some(data) = sound_data {
-            let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (*data.samples).clone());
-            
-            let levels = Arc::new(Mutex::new(LevelData {
-                peak: 0.0,
-                rms: 0.0,
-                volume,
-                last_update: Instant::now(),
-            }));
-            
+        if let Some(data) = sound_data {
             if let Ok(sink) = Sink::try_new(&stream_handle) {
                 let sink = Arc::new(sink);
-                let metered_source = LevelMeter::new(source_buffered, levels.clone());
+                
+                let levels = Arc::new(Mutex::new(LevelData {
+                    peak: 0.0,
+                    rms: 0.0,
+                    volume,
+                    last_update: Instant::now(),
+                }));
+                
+                if let Some(samples) = data.samples {
+                    let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (*samples).clone());
+                    let metered_source = LevelMeter::new(source_buffered, levels.clone());
+                    sink.append(metered_source);
+                } else {
+                    // Streaming large file
+                    if let Ok(file) = File::open(&path_clone) {
+                        let reader = BufReader::new(file);
+                        if let Ok(source) = Decoder::new(reader) {
+                            let metered_source = LevelMeter::new(source.convert_samples::<f32>(), levels.clone());
+                            sink.append(metered_source);
+                        }
+                    }
+                }
                 
                 meter_manager.add_meter(levels.clone(), Arc::clone(&sink));
                 sink.set_volume(volume * master_vol);
-                sink.append(metered_source);
                 
                 let start_time = std::time::Instant::now();
                 let base_offset = Duration::from_secs(0);
@@ -547,7 +626,7 @@ pub fn play_sound(
                         is_paused: current_sink.is_paused(),
                     });
                     
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::sleep(Duration::from_millis(30));
                     
                     if current_sink.empty() { 
                         let sinks_check = sinks.lock().unwrap();
@@ -580,7 +659,7 @@ pub fn play_sound(
 }
 
 #[tauri::command]
-pub fn toggle_pause_instance(state: State<AudioState>, instance_id: u32) -> Result<bool, String> {
+pub async fn toggle_pause_instance(state: State<'_, AudioState>, instance_id: u32) -> Result<bool, String> {
     let sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
     if let Some((_, _, sink, _, _, _, _)) = sinks.get(&instance_id) {
         if sink.is_paused() {
@@ -596,7 +675,7 @@ pub fn toggle_pause_instance(state: State<AudioState>, instance_id: u32) -> Resu
 }
 
 #[tauri::command]
-pub fn stop_instance(state: State<AudioState>, instance_id: u32) -> Result<(), String> {
+pub async fn stop_instance(state: State<'_, AudioState>, instance_id: u32) -> Result<(), String> {
     let mut sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
     if let Some((_, _, sink, _, _, _, _)) = sinks.remove(&instance_id) {
         sink.stop();
@@ -605,7 +684,7 @@ pub fn stop_instance(state: State<AudioState>, instance_id: u32) -> Result<(), S
 }
 
 #[tauri::command]
-pub fn seek_instance(state: State<AudioState>, instance_id: u32, position_ms: u64) -> Result<(), String> {
+pub async fn seek_instance(state: State<'_, AudioState>, instance_id: u32, position_ms: u64) -> Result<(), String> {
     let mut sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
     let cache_guard = state.cache.lock().unwrap();
     let master_vol = *state.master_volume.lock().unwrap();
@@ -616,11 +695,8 @@ pub fn seek_instance(state: State<AudioState>, instance_id: u32, position_ms: u6
             sink.stop();
             
             let handle = state.get_or_create_stream_handle(&state.current_device_name.lock().unwrap())?;
-                if let Ok(new_sink) = Sink::try_new(&handle) {
+            if let Ok(new_sink) = Sink::try_new(&handle) {
                 let new_sink = Arc::new(new_sink);
-                
-                let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (*data.samples).clone());
-                let skipped_source = source_buffered.skip_duration(Duration::from_millis(position_ms));
                 
                 let levels = Arc::new(Mutex::new(LevelData {
                     peak: 0.0,
@@ -628,12 +704,27 @@ pub fn seek_instance(state: State<AudioState>, instance_id: u32, position_ms: u6
                     volume: *volume,
                     last_update: Instant::now(),
                 }));
-                let metered_source = LevelMeter::new(skipped_source, levels.clone());
+                
+                if let Some(samples) = &data.samples {
+                    let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (**samples).clone());
+                    let skipped_source = source_buffered.skip_duration(Duration::from_millis(position_ms));
+                    let metered_source = LevelMeter::new(skipped_source, levels.clone());
+                    new_sink.append(metered_source);
+                } else {
+                    // Seek in streamed large file
+                    if let Ok(file) = File::open(path) {
+                        let reader = BufReader::new(file);
+                        if let Ok(source) = Decoder::new(reader) {
+                            let skipped_source = source.skip_duration(Duration::from_millis(position_ms)).convert_samples::<f32>();
+                            let metered_source = LevelMeter::new(skipped_source, levels.clone());
+                            new_sink.append(metered_source);
+                        }
+                    }
+                }
                 
                 state.meter_manager.add_meter(levels, Arc::clone(&new_sink));
                 
                 new_sink.set_volume(*volume * master_vol);
-                new_sink.append(metered_source);
                 
                 if was_paused {
                     new_sink.pause();
@@ -649,7 +740,7 @@ pub fn seek_instance(state: State<AudioState>, instance_id: u32, position_ms: u6
 }
 
 #[tauri::command]
-pub fn stop_all(state: State<AudioState>) -> Result<(), String> {
+pub async fn stop_all(state: State<'_, AudioState>) -> Result<(), String> {
     let mut sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
     for (_, (_, _, sink, _, _, _, _)) in sinks.iter() {
         sink.stop();

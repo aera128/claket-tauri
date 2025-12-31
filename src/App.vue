@@ -165,7 +165,8 @@ const isSegmentActive = (index: number, total: number) => {
     <TitleBar />
     <div class="w-full h-screen flex flex-col relative overflow-hidden">
       <header class="w-full p-6 flex justify-center fixed top-2 left-0 right-0 z-50 pointer-events-none">
-        <div class="island-navbar pointer-events-auto flex items-center justify-between gap-6 px-6 h-12 rounded-full border border-border bg-card/60 backdrop-blur-2xl shadow-2xl min-w-[500px] max-w-[95%] transition-all duration-500 hover:scale-[1.01] hover:border-primary/20 text-slate-950 dark:text-white">
+        <div class="island-navbar pointer-events-auto flex items-center justify-between gap-6 px-6 h-12 rounded-full border border-border bg-card/60 shadow-2xl min-w-[500px] max-w-[95%] transition-all duration-500 hover:scale-[1.01] hover:border-primary/20 text-slate-950 dark:text-white"
+             :class="{ 'backdrop-blur-2xl': !store.reducedMotion }">
           <h1 class="text-base font-bold tracking-tight flex items-center gap-2 text-nowrap">
             <img :src="logo" class="w-6 h-6 object-contain brightness-110" alt="Claket Logo" />
             Claket
@@ -352,7 +353,8 @@ const isSegmentActive = (index: number, total: number) => {
       </ScrollArea>
 
       <Transition name="slide-up">
-        <div v-if="store.isQueueExpanded" class="fixed inset-0 z-30 bg-background/60 backdrop-blur-xl flex flex-col pt-20">
+        <div v-if="store.isQueueExpanded" class="fixed inset-0 z-30 bg-background/60 flex flex-col pt-20"
+             :class="{ 'backdrop-blur-xl': !store.reducedMotion }">
           <div class="flex-1 overflow-y-auto p-8 max-w-4xl mx-auto w-full text-slate-950 dark:text-white">
              <div class="flex items-center justify-between mb-8">
                 <h2 class="text-3xl font-bold flex items-center gap-3">
@@ -411,7 +413,8 @@ const isSegmentActive = (index: number, total: number) => {
         </div>
       </Transition>
       
-      <footer class="fixed bottom-0 left-0 right-0 border-t bg-card/80 backdrop-blur-xl z-40 text-slate-950 dark:text-white">
+      <footer class="fixed bottom-0 left-0 right-0 border-t bg-card/80 z-40 text-slate-950 dark:text-white"
+              :class="{ 'backdrop-blur-xl': !store.reducedMotion }">
         <div class="w-full h-1 bg-accent/30 relative cursor-pointer group">
           <Slider 
             v-if="store.latestProgress"
@@ -503,7 +506,7 @@ const isSegmentActive = (index: number, total: number) => {
                      :class="getVUColor(i, store.isVUMeterExpanded ? 48 : 12)"
                      :style="{ 
                        opacity: isSegmentActive(i, store.isVUMeterExpanded ? 48 : 12) ? 1 : 0.1,
-                       boxShadow: isSegmentActive(i, store.isVUMeterExpanded ? 48 : 12) ? '0 0 6px currentColor' : 'none'
+                       boxShadow: !store.reducedMotion && isSegmentActive(i, store.isVUMeterExpanded ? 48 : 12) ? '0 0 6px currentColor' : 'none'
                      }">
                 </div>
                 
