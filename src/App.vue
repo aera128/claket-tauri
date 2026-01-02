@@ -8,6 +8,7 @@ import { Slider } from "@/components/ui/slider";
 import { Toaster } from "@/components/ui/sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Square, Music, Play, Pause, ListMusic, ChevronDown, Trash2, Moon, Sun, ChevronLeft, ChevronRight, Plus, Pencil, Settings, Monitor, Laptop, AlignLeft, AlignRight } from "lucide-vue-next";
+import { formatDuration } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -382,7 +383,7 @@ const isSegmentActive = (index: number, total: number) => {
                       <div>
                         <div class="font-bold text-lg leading-tight">{{ item.name }}</div>
                         <div class="text-xs text-muted-foreground font-mono uppercase tracking-widest text-nowrap text-[10px]">
-                          ID: {{ item.instance_id }} • {{ Math.floor(item.position_ms / 1000) }}s / {{ Math.floor(item.duration_ms / 1000) }}s
+                          ID: {{ item.instance_id }} • {{ formatDuration(item.position_ms) }} / {{ formatDuration(item.duration_ms) }}
                         </div>
                       </div>
                     </div>
@@ -452,7 +453,7 @@ const isSegmentActive = (index: number, total: number) => {
                  {{ store.latestProgress?.name || 'No sound playing' }}
               </div>
               <div class="text-[10px] text-muted-foreground uppercase tracking-wider font-bold">
-                 {{ store.latestProgress ? `${Math.floor(store.latestProgress.position_ms / 1000)}s / ${Math.floor(store.latestProgress.duration_ms / 1000)}s` : 'Ready' }}
+                 {{ store.latestProgress ? `${formatDuration(store.latestProgress.position_ms)} / ${formatDuration(store.latestProgress.duration_ms)}` : 'Ready' }}
               </div>
             </div>
           </div>

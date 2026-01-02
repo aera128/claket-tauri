@@ -1,15 +1,147 @@
 use cpal::traits::{DeviceTrait, HostTrait};
-use lofty::file::AudioFile;
-use lofty::probe::Probe;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source, buffer::SamplesBuffer};
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{Decoder as SymphoniaDecoder, DecoderOptions};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use serde::Serialize;
+
+struct SymphoniaSource {
+    reader: Box<dyn FormatReader + Send>,
+    decoder: Box<dyn SymphoniaDecoder + Send>,
+    track_id: u32,
+    sample_buffer: Vec<f32>,
+    current_sample_offset: usize,
+    channels: u16,
+    sample_rate: u32,
+    total_duration: Option<Duration>,
+}
+
+impl SymphoniaSource {
+    fn new(path: &str, start_time: Option<Duration>) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut hint = Hint::new();
+        
+        if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
+
+        let probed = symphonia::default::get_probe()
+            .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+            .map_err(|e| e.to_string())?;
+
+        let mut reader = probed.format;
+        let track = reader.tracks()
+            .iter()
+            .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+            .ok_or("No supported audio track found")?;
+
+        let track_id = track.id;
+        let channels = track.codec_params.channels.map(|c| c.count() as u16).unwrap_or(2);
+        let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+        
+        let total_duration = track.codec_params.n_frames
+            .map(|f| Duration::from_secs_f64(f as f64 / sample_rate as f64));
+
+        let decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .map_err(|e| e.to_string())?;
+
+        if let Some(seek_time) = start_time {
+            let _ = reader.seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: Time::from(seek_time.as_secs_f64()),
+                    track_id: Some(track_id),
+                },
+            );
+        }
+
+        Ok(Self {
+            reader,
+            decoder,
+            track_id,
+            sample_buffer: Vec::new(),
+            current_sample_offset: 0,
+            channels,
+            sample_rate,
+            total_duration,
+        })
+    }
+}
+
+impl Iterator for SymphoniaSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current_sample_offset >= self.sample_buffer.len() {
+            loop {
+                let packet = match self.reader.next_packet() {
+                    Ok(p) => p,
+                    Err(_) => return None,
+                };
+
+                if packet.track_id() != self.track_id {
+                    continue;
+                }
+
+                match self.decoder.decode(&packet) {
+                    Ok(decoded) => {
+                        let spec = *decoded.spec();
+                        let duration = decoded.capacity() as u64;
+                        let mut sample_buf = SampleBuffer::<f32>::new(duration, spec);
+                        sample_buf.copy_interleaved_ref(decoded);
+                        
+                        self.sample_buffer.clear();
+                        self.sample_buffer.extend_from_slice(sample_buf.samples());
+                        self.current_sample_offset = 0;
+                        
+                        if !self.sample_buffer.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        if self.current_sample_offset < self.sample_buffer.len() {
+            let sample = self.sample_buffer[self.current_sample_offset];
+            self.current_sample_offset += 1;
+            Some(sample)
+        } else {
+            None
+        }
+    }
+}
+
+impl Source for SymphoniaSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.total_duration
+    }
+}
 
 struct SendWrapper<T>(T);
 unsafe impl<T> Send for SendWrapper<T> {}
@@ -221,8 +353,6 @@ impl MeterManager {
     }
 }
 
-const CACHE_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024; // 5MB
-
 #[derive(Clone, Serialize)]
 struct AudioProgress {
     id: String,
@@ -235,9 +365,6 @@ struct AudioProgress {
 
 #[derive(Clone)]
 struct CachedSound {
-    channels: u16,
-    sample_rate: u32,
-    samples: Option<Arc<Vec<f32>>>,
     duration: Duration,
 }
 
@@ -296,61 +423,34 @@ impl AudioState {
 
     pub fn migrate_active_sinks(&self, handle: &OutputStreamHandle) {
         let mut sinks_guard = self.sinks.lock().unwrap();
-        let cache_guard = self.cache.lock().unwrap();
         let master_vol = *self.master_volume.lock().unwrap();
 
         for (_instance_id, (_id, path, sink, volume, _name, start_time, base_offset)) in sinks_guard.iter_mut() {
-            if let Some(data) = cache_guard.get(path) {
-                // Calculate current position before stopping old sink
-                let elapsed = if sink.is_paused() {
-                    Duration::from_secs(0) // Simplification for paused migration
-                } else {
-                    start_time.elapsed()
-                };
-                let current_pos = elapsed + *base_offset;
+            // Calculate current position before stopping old sink
+            let elapsed = if sink.is_paused() {
+                Duration::from_secs(0) // Simplification for paused migration
+            } else {
+                start_time.elapsed()
+            };
+            let current_pos = elapsed + *base_offset;
 
-                // Create new sink on the new device
-                if let Ok(new_sink) = Sink::try_new(handle) {
-                    let new_sink = Arc::new(new_sink);
+            // Create new sink on the new device
+            if let Ok(new_sink) = Sink::try_new(handle) {
+                let new_sink = Arc::new(new_sink);
+                
+                if let Ok(source) = SymphoniaSource::new(path, Some(current_pos)) {
+                    let levels = Arc::new(Mutex::new(LevelData {
+                        peak: 0.0,
+                        rms: 0.0,
+                        volume: *volume,
+                        last_update: Instant::now(),
+                    }));
+                    let metered_source = LevelMeter::new(source, levels.clone());
                     
-                    if let Some(samples) = &data.samples {
-                        let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (**samples).clone());
-                        let skipped_source = source_buffered.skip_duration(current_pos);
-                        
-                        let levels = Arc::new(Mutex::new(LevelData {
-                            peak: 0.0,
-                            rms: 0.0,
-                            volume: *volume,
-                            last_update: Instant::now(),
-                        }));
-                        let metered_source = LevelMeter::new(skipped_source, levels.clone());
-                        
-                        self.meter_manager.add_meter(levels, Arc::clone(&new_sink));
-                        
-                        new_sink.set_volume(*volume * master_vol);
-                        new_sink.append(metered_source);
-                    } else {
-                        // Streaming for large files during migration
-                        if let Ok(file) = File::open(path) {
-                            let reader = BufReader::new(file);
-                            if let Ok(source) = Decoder::new(reader) {
-                                let skipped_source = source.skip_duration(current_pos).convert_samples::<f32>();
-                                
-                                let levels = Arc::new(Mutex::new(LevelData {
-                                    peak: 0.0,
-                                    rms: 0.0,
-                                    volume: *volume,
-                                    last_update: Instant::now(),
-                                }));
-                                let metered_source = LevelMeter::new(skipped_source, levels.clone());
-                                
-                                self.meter_manager.add_meter(levels, Arc::clone(&new_sink));
-                                
-                                new_sink.set_volume(*volume * master_vol);
-                                new_sink.append(metered_source);
-                            }
-                        }
-                    }
+                    self.meter_manager.add_meter(levels, Arc::clone(&new_sink));
+                    
+                    new_sink.set_volume(*volume * master_vol);
+                    new_sink.append(metered_source);
                     
                     if sink.is_paused() {
                         new_sink.pause();
@@ -438,33 +538,9 @@ pub async fn preload_sound(state: State<'_, AudioState>, path: String) -> Result
     std::thread::spawn(move || {
         let mut cache_guard = cache.lock().unwrap();
         if !cache_guard.contains_key(&path) {
-            if let Ok(file) = File::open(&path) {
-                let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                let reader = BufReader::new(file);
-                
-                if let Ok(source) = Decoder::new(reader) {
-                    let duration = Probe::open(&path)
-                        .ok()
-                        .and_then(|probed| probed.read().ok())
-                        .map(|tagged| tagged.properties().duration())
-                        .unwrap_or_else(|| source.total_duration().unwrap_or(Duration::from_secs(0)));
-
-                    let channels = source.channels();
-                    let sample_rate = source.sample_rate();
-                    
-                    let samples = if file_size <= CACHE_THRESHOLD_BYTES {
-                        Some(Arc::new(source.convert_samples().collect()))
-                    } else {
-                        None
-                    };
-
-                    cache_guard.insert(path, CachedSound {
-                        channels,
-                        sample_rate,
-                        samples,
-                        duration,
-                    });
-                }
+            if let Ok(source) = SymphoniaSource::new(&path, None) {
+                let duration = source.total_duration().unwrap_or(Duration::from_secs(0));
+                cache_guard.insert(path, CachedSound { duration });
             }
         }
     });
@@ -499,44 +575,20 @@ pub async fn play_sound(
     let meter_manager = Arc::clone(&state.meter_manager);
     
     std::thread::spawn(move || {
-        let sound_data = {
+        let duration = {
             let mut cache_guard = cache.lock().unwrap();
             if let Some(cached) = cache_guard.get(&path_clone) {
-                Some(cached.clone())
+                cached.duration
             } else {
-                if let Ok(file) = File::open(&path_clone) {
-                    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                    let reader = BufReader::new(file);
-                    if let Ok(source) = Decoder::new(reader) {
-                        let duration = Probe::open(&path_clone)
-                            .ok()
-                            .and_then(|probed| probed.read().ok())
-                            .map(|tagged| tagged.properties().duration())
-                            .unwrap_or_else(|| source.total_duration().unwrap_or(Duration::from_secs(0)));
-
-                        let channels = source.channels();
-                        let sample_rate = source.sample_rate();
-                        
-                        let samples = if file_size <= CACHE_THRESHOLD_BYTES {
-                            Some(Arc::new(source.convert_samples().collect()))
-                        } else {
-                            None
-                        };
-
-                        let cached = CachedSound {
-                            channels,
-                            sample_rate,
-                            samples,
-                            duration,
-                        };
-                        cache_guard.insert(path_clone.clone(), cached.clone());
-                        Some(cached)
-                    } else { None }
-                } else { None }
+                if let Ok(source) = SymphoniaSource::new(&path_clone, None) {
+                    let d = source.total_duration().unwrap_or(Duration::from_secs(0));
+                    cache_guard.insert(path_clone.clone(), CachedSound { duration: d });
+                    d
+                } else { Duration::from_secs(0) }
             }
         };
 
-        if let Some(data) = sound_data {
+        if let Ok(source) = SymphoniaSource::new(&path_clone, None) {
             if let Ok(sink) = Sink::try_new(&stream_handle) {
                 let sink = Arc::new(sink);
                 
@@ -547,20 +599,8 @@ pub async fn play_sound(
                     last_update: Instant::now(),
                 }));
                 
-                if let Some(samples) = data.samples {
-                    let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (*samples).clone());
-                    let metered_source = LevelMeter::new(source_buffered, levels.clone());
-                    sink.append(metered_source);
-                } else {
-                    // Streaming large file
-                    if let Ok(file) = File::open(&path_clone) {
-                        let reader = BufReader::new(file);
-                        if let Ok(source) = Decoder::new(reader) {
-                            let metered_source = LevelMeter::new(source.convert_samples::<f32>(), levels.clone());
-                            sink.append(metered_source);
-                        }
-                    }
-                }
+                let metered_source = LevelMeter::new(source, levels.clone());
+                sink.append(metered_source);
                 
                 meter_manager.add_meter(levels.clone(), Arc::clone(&sink));
                 sink.set_volume(volume * master_vol);
@@ -573,7 +613,7 @@ pub async fn play_sound(
                     sinks_guard.insert(instance_id, (id_clone.clone(), path_clone.clone(), Arc::clone(&sink), volume, name_clone.clone(), start_time, base_offset));
                 }
                 
-                let duration_ms = data.duration.as_millis() as u64;
+                let duration_ms = duration.as_millis() as u64;
                 let mut paused_duration = Duration::from_secs(0);
                 let mut last_pause_start = None;
                 let mut last_processed_offset = base_offset;
@@ -686,18 +726,17 @@ pub async fn stop_instance(state: State<'_, AudioState>, instance_id: u32) -> Re
 #[tauri::command]
 pub async fn seek_instance(state: State<'_, AudioState>, instance_id: u32, position_ms: u64) -> Result<(), String> {
     let mut sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
-    let cache_guard = state.cache.lock().unwrap();
     let master_vol = *state.master_volume.lock().unwrap();
 
     if let Some((_, path, sink, volume, _, start_time, base_offset)) = sinks.get_mut(&instance_id) {
-        if let Some(data) = cache_guard.get(path) {
-            let was_paused = sink.is_paused();
-            sink.stop();
+        let was_paused = sink.is_paused();
+        sink.stop();
+        
+        let handle = state.get_or_create_stream_handle(&state.current_device_name.lock().unwrap())?;
+        if let Ok(new_sink) = Sink::try_new(&handle) {
+            let new_sink = Arc::new(new_sink);
             
-            let handle = state.get_or_create_stream_handle(&state.current_device_name.lock().unwrap())?;
-            if let Ok(new_sink) = Sink::try_new(&handle) {
-                let new_sink = Arc::new(new_sink);
-                
+            if let Ok(source) = SymphoniaSource::new(path, Some(Duration::from_millis(position_ms))) {
                 let levels = Arc::new(Mutex::new(LevelData {
                     peak: 0.0,
                     rms: 0.0,
@@ -705,22 +744,8 @@ pub async fn seek_instance(state: State<'_, AudioState>, instance_id: u32, posit
                     last_update: Instant::now(),
                 }));
                 
-                if let Some(samples) = &data.samples {
-                    let source_buffered = SamplesBuffer::new(data.channels, data.sample_rate, (**samples).clone());
-                    let skipped_source = source_buffered.skip_duration(Duration::from_millis(position_ms));
-                    let metered_source = LevelMeter::new(skipped_source, levels.clone());
-                    new_sink.append(metered_source);
-                } else {
-                    // Seek in streamed large file
-                    if let Ok(file) = File::open(path) {
-                        let reader = BufReader::new(file);
-                        if let Ok(source) = Decoder::new(reader) {
-                            let skipped_source = source.skip_duration(Duration::from_millis(position_ms)).convert_samples::<f32>();
-                            let metered_source = LevelMeter::new(skipped_source, levels.clone());
-                            new_sink.append(metered_source);
-                        }
-                    }
-                }
+                let metered_source = LevelMeter::new(source, levels.clone());
+                new_sink.append(metered_source);
                 
                 state.meter_manager.add_meter(levels, Arc::clone(&new_sink));
                 
