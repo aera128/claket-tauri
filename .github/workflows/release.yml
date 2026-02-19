@@ -49,7 +49,7 @@ jobs:
       - name: install dependencies (macos only)
         if: matrix.platform == 'macos-latest'
         run: |
-          brew install opus
+          brew install opus pkg-config
 
       - name: install frontend dependencies
         run: bun install
@@ -57,6 +57,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG_CONFIG_PATH: ${{ matrix.platform == 'macos-latest' && '/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig' || '' }}
+          CMAKE_POLICY_VERSION_MINIMUM: ${{ matrix.platform == 'macos-latest' && '3.5' || '' }}
         with:
           tagName: v__VERSION__
           releaseName: "Claket Soundboard v__VERSION__"
