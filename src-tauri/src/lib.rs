@@ -3,10 +3,31 @@ mod audio;
 use audio::AudioState;
 
 use tauri::{Emitter, Listener, Manager};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
+}
+
+#[tauri::command]
+async fn register_global_shortcut(app: tauri::AppHandle, shortcut: String, button_id: u32) -> Result<(), String> {
+    let shortcut_obj: Shortcut = shortcut.parse().map_err(|e| format!("Invalid shortcut: {}", e))?;
+    
+    app.global_shortcut().on_shortcut(shortcut_obj.clone(), move |app, _shortcut, event| {
+        if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+            let _ = app.emit("global-shortcut-triggered", button_id);
+        }
+    }).map_err(|e| format!("Failed to register shortcut: {}", e))?;
+    
+    Ok(())
+}
+
+#[tauri::command]
+async fn unregister_global_shortcut(app: tauri::AppHandle, shortcut: String) -> Result<(), String> {
+    let shortcut_obj: Shortcut = shortcut.parse().map_err(|e| format!("Invalid shortcut: {}", e))?;
+    app.global_shortcut().unregister(shortcut_obj).map_err(|e| format!("Failed to unregister shortcut: {}", e))?;
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -38,6 +59,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             greet,
             audio::list_audio_devices,
@@ -49,8 +71,11 @@ pub fn run() {
             audio::stop_instance,
             audio::seek_instance,
             audio::stop_all,
+            audio::update_button_volume,
             audio::save_sound_file,
-            audio::delete_sound_file
+            audio::delete_sound_file,
+            register_global_shortcut,
+            unregister_global_shortcut
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

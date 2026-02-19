@@ -1,6 +1,6 @@
 [package]
 name = "claket"
-version = "0.1.0"
+version = "0.2.0"
 description = "A modern, high-performance native soundboard for streamers and power users."
 authors = ["sk4ur"]
 edition = "2021"
@@ -26,9 +26,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rodio = { version = "0.19", features = ["symphonia-all"] }
 cpal = "0.15"
-symphonia = { version = "=0.5.4", features = ["all"] }
+symphonia = { version = "0.5", features = ["all", "opt-simd"] }
+symphonia-bundle-flac = "0.5"
+symphonia-bundle-mp3 = "0.5"
+symphonia-codec-aac = "0.5"
+symphonia-codec-alac = "0.5"
+symphonia-codec-vorbis = "0.5"
+symphonia-format-ogg = "0.5"
+symphonia-format-mkv = "0.5"
+symphonia-format-isomp4 = "0.5"
 tauri-plugin-store = "2.4.1"
 tauri-plugin-dialog = "2"
+opus = "0.3.1"
+ogg = "0.9.2"
+tauri-plugin-global-shortcut = "2.3.1"
 
 [profile.dev]
 incremental = true # Compile your binary in smaller steps.

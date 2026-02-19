@@ -9,11 +9,161 @@ use symphonia::core::probe::Hint;
 use symphonia::core::units::Time;
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use serde::Serialize;
+use ogg::PacketReader;
+use opus::{Decoder as OpusDecoder, Channels};
+
+fn is_opus_ogg(path: &str) -> bool {
+    if let Ok(file) = File::open(path) {
+        let reader = BufReader::new(file);
+        let mut packet_reader = PacketReader::new(reader);
+        
+        if let Ok(Some(packet)) = packet_reader.read_packet() {
+            let data = packet.data;
+            if data.len() >= 8 {
+                if &data[0..8] == b"OpusHead" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+struct OpusOggSource {
+    packet_reader: PacketReader<BufReader<File>>,
+    decoder: OpusDecoder,
+    sample_buffer: Vec<f32>,
+    buffer_offset: usize,
+    channels: u16,
+    sample_rate: u32,
+    total_duration: Option<Duration>,
+    #[allow(dead_code)]
+    current_position_bytes: u64,
+    eos: bool,
+}
+
+impl OpusOggSource {
+    fn new(path: &str, _start_time: Option<Duration>) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| format!("Failed to open Opus file: {}", e))?;
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let reader = BufReader::new(file);
+        let mut packet_reader = PacketReader::new(reader);
+        
+        let mut channels = 2u16;
+        let mut sample_rate = 48000u32;
+        
+        if let Ok(Some(packet)) = packet_reader.read_packet() {
+            let data = &packet.data;
+            if data.len() >= 19 && &data[0..8] == b"OpusHead" {
+                let version = data[8];
+                if version == 1 {
+                    channels = data[9] as u16;
+                    sample_rate = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+                }
+            }
+        }
+        
+        packet_reader.seek_absgp(None, 0).ok();
+        
+        let decoder = OpusDecoder::new(sample_rate, if channels == 1 { Channels::Mono } else { Channels::Stereo })
+            .map_err(|e| format!("Failed to create Opus decoder: {}", e))?;
+        
+        let estimated_duration = if sample_rate > 0 && file_size > 0 {
+            let avg_bitrate = 128_000.0;
+            Some(Duration::from_secs_f64(file_size as f64 * 8.0 / avg_bitrate))
+        } else {
+            None
+        };
+        
+        Ok(Self {
+            packet_reader,
+            decoder,
+            sample_buffer: Vec::new(),
+            buffer_offset: 0,
+            channels,
+            sample_rate,
+            total_duration: estimated_duration,
+            current_position_bytes: 0,
+            eos: false,
+        })
+    }
+}
+
+impl Iterator for OpusOggSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.eos {
+            return None;
+        }
+        
+        while self.buffer_offset >= self.sample_buffer.len() {
+            self.sample_buffer.clear();
+            self.buffer_offset = 0;
+            
+            match self.packet_reader.read_packet() {
+                Ok(Some(packet)) => {
+                    if packet.data.len() >= 8 && &packet.data[0..8] == b"OpusTags" {
+                        continue;
+                    }
+                    
+                    if packet.data.is_empty() {
+                        continue;
+                    }
+                    
+                    let max_frame_size = 5760;
+                    let output_size = if self.channels == 1 { max_frame_size } else { max_frame_size * 2 };
+                    let mut output = vec![0f32; output_size];
+                    
+                    match self.decoder.decode_float(&packet.data, &mut output, false) {
+                        Ok(samples_decoded) => {
+                            let total_samples = samples_decoded * self.channels as usize;
+                            self.sample_buffer = output[..total_samples].to_vec();
+                            self.current_position_bytes += packet.data.len() as u64;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    self.eos = true;
+                    return None;
+                }
+            }
+        }
+        
+        if self.buffer_offset < self.sample_buffer.len() {
+            let sample = self.sample_buffer[self.buffer_offset];
+            self.buffer_offset += 1;
+            Some(sample)
+        } else {
+            None
+        }
+    }
+}
+
+impl Source for OpusOggSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.total_duration
+    }
+}
 
 struct SymphoniaSource {
     reader: Box<dyn FormatReader + Send>,
@@ -28,7 +178,7 @@ struct SymphoniaSource {
 
 impl SymphoniaSource {
     fn new(path: &str, start_time: Option<Duration>) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
+        let file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         
@@ -36,17 +186,24 @@ impl SymphoniaSource {
             hint.with_extension(ext);
         }
 
+        let format_opts = FormatOptions {
+            enable_gapless: true,
+            ..Default::default()
+        };
+
         let probed = symphonia::default::get_probe()
-            .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
-            .map_err(|e| e.to_string())?;
+            .format(&hint, mss, &format_opts, &MetadataOptions::default())
+            .map_err(|e| format!("Unsupported format: {}", e))?;
 
         let mut reader = probed.format;
+        
         let track = reader.tracks()
             .iter()
             .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
-            .ok_or("No supported audio track found")?;
+            .ok_or("No supported audio track found. Supported codecs: MP3, FLAC, Vorbis, AAC, ALAC, WAV, PCM")?;
 
         let track_id = track.id;
+        let codec = track.codec_params.codec;
         let channels = track.codec_params.channels.map(|c| c.count() as u16).unwrap_or(2);
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
         
@@ -55,7 +212,10 @@ impl SymphoniaSource {
 
         let decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| {
+                let codec_name = format!("{:?}", codec);
+                format!("Unsupported codec '{}'. Supported: MP3, FLAC, Vorbis, AAC, ALAC, WAV, PCM", codec_name)
+            })?;
 
         if let Some(seek_time) = start_time {
             let _ = reader.seek(
@@ -371,7 +531,7 @@ struct CachedSound {
 pub struct AudioState {
     pub current_device_name: Arc<Mutex<String>>,
     pub master_volume: Arc<Mutex<f32>>,
-    pub sinks: Arc<Mutex<HashMap<u32, (String, String, Arc<Sink>, f32, String, std::time::Instant, Duration)>>>,
+    pub sinks: Arc<Mutex<HashMap<u32, (String, String, Arc<Sink>, f32, String, std::time::Instant, Duration, Arc<Mutex<LevelData>>)>>>,
     active_streams: Arc<Mutex<HashMap<String, (SendWrapper<OutputStream>, OutputStreamHandle)>>>,
     instance_counter: Arc<Mutex<u32>>,
     cache: Arc<Mutex<HashMap<String, CachedSound>>>,
@@ -425,29 +585,27 @@ impl AudioState {
         let mut sinks_guard = self.sinks.lock().unwrap();
         let master_vol = *self.master_volume.lock().unwrap();
 
-        for (_instance_id, (_id, path, sink, volume, _name, start_time, base_offset)) in sinks_guard.iter_mut() {
-            // Calculate current position before stopping old sink
+        for (_instance_id, (_id, path, sink, volume, _name, start_time, base_offset, levels)) in sinks_guard.iter_mut() {
             let elapsed = if sink.is_paused() {
-                Duration::from_secs(0) // Simplification for paused migration
+                Duration::from_secs(0)
             } else {
                 start_time.elapsed()
             };
             let current_pos = elapsed + *base_offset;
 
-            // Create new sink on the new device
             if let Ok(new_sink) = Sink::try_new(handle) {
                 let new_sink = Arc::new(new_sink);
                 
                 if let Ok(source) = SymphoniaSource::new(path, Some(current_pos)) {
-                    let levels = Arc::new(Mutex::new(LevelData {
+                    let new_levels = Arc::new(Mutex::new(LevelData {
                         peak: 0.0,
                         rms: 0.0,
                         volume: *volume,
                         last_update: Instant::now(),
                     }));
-                    let metered_source = LevelMeter::new(source, levels.clone());
+                    let metered_source = LevelMeter::new(source, new_levels.clone());
                     
-                    self.meter_manager.add_meter(levels, Arc::clone(&new_sink));
+                    self.meter_manager.add_meter(new_levels.clone(), Arc::clone(&new_sink));
                     
                     new_sink.set_volume(*volume * master_vol);
                     new_sink.append(metered_source);
@@ -456,11 +614,11 @@ impl AudioState {
                         new_sink.pause();
                     }
 
-                    // Stop old sink and replace it
                     sink.stop();
                     *sink = new_sink;
                     *start_time = std::time::Instant::now();
                     *base_offset = current_pos;
+                    *levels = new_levels;
                 }
             }
         }
@@ -525,7 +683,7 @@ pub async fn update_master_volume(state: State<'_, AudioState>, volume: f32) -> 
     *master_vol = volume;
     
     let sinks = state.sinks.lock().unwrap();
-    for (_, (_, _, sink, button_vol, _, _, _)) in sinks.iter() {
+    for (_, (_, _, sink, button_vol, _, _, _, _)) in sinks.iter() {
         sink.set_volume(button_vol * volume);
     }
     Ok(())
@@ -534,13 +692,22 @@ pub async fn update_master_volume(state: State<'_, AudioState>, volume: f32) -> 
 #[tauri::command]
 pub async fn preload_sound(state: State<'_, AudioState>, path: String) -> Result<(), String> {
     let cache = Arc::clone(&state.cache);
+    let is_opus = is_opus_ogg(&path);
     
     std::thread::spawn(move || {
         let mut cache_guard = cache.lock().unwrap();
         if !cache_guard.contains_key(&path) {
-            if let Ok(source) = SymphoniaSource::new(&path, None) {
-                let duration = source.total_duration().unwrap_or(Duration::from_secs(0));
-                cache_guard.insert(path, CachedSound { duration });
+            let duration = if is_opus {
+                OpusOggSource::new(&path, None)
+                    .ok()
+                    .and_then(|s| s.total_duration())
+            } else {
+                SymphoniaSource::new(&path, None)
+                    .ok()
+                    .and_then(|s| s.total_duration())
+            };
+            if let Some(d) = duration {
+                cache_guard.insert(path, CachedSound { duration: d });
             }
         }
     });
@@ -573,6 +740,7 @@ pub async fn play_sound(
     let name_clone = name.clone();
     let path_clone = path.clone();
     let meter_manager = Arc::clone(&state.meter_manager);
+    let is_opus = is_opus_ogg(&path_clone);
     
     std::thread::spawn(move || {
         let duration = {
@@ -580,15 +748,29 @@ pub async fn play_sound(
             if let Some(cached) = cache_guard.get(&path_clone) {
                 cached.duration
             } else {
-                if let Ok(source) = SymphoniaSource::new(&path_clone, None) {
-                    let d = source.total_duration().unwrap_or(Duration::from_secs(0));
-                    cache_guard.insert(path_clone.clone(), CachedSound { duration: d });
-                    d
-                } else { Duration::from_secs(0) }
+                let d = if is_opus {
+                    OpusOggSource::new(&path_clone, None)
+                        .ok()
+                        .and_then(|s| s.total_duration())
+                        .unwrap_or(Duration::from_secs(0))
+                } else {
+                    SymphoniaSource::new(&path_clone, None)
+                        .ok()
+                        .and_then(|s| s.total_duration())
+                        .unwrap_or(Duration::from_secs(0))
+                };
+                cache_guard.insert(path_clone.clone(), CachedSound { duration: d });
+                d
             }
         };
 
-        if let Ok(source) = SymphoniaSource::new(&path_clone, None) {
+        let result = if is_opus {
+            OpusOggSource::new(&path_clone, None).map(|s| Box::new(s) as Box<dyn Source<Item = f32> + Send>)
+        } else {
+            SymphoniaSource::new(&path_clone, None).map(|s| Box::new(s) as Box<dyn Source<Item = f32> + Send>)
+        };
+
+        if let Ok(source) = result {
             if let Ok(sink) = Sink::try_new(&stream_handle) {
                 let sink = Arc::new(sink);
                 
@@ -610,7 +792,7 @@ pub async fn play_sound(
 
                 {
                     let mut sinks_guard = sinks.lock().unwrap();
-                    sinks_guard.insert(instance_id, (id_clone.clone(), path_clone.clone(), Arc::clone(&sink), volume, name_clone.clone(), start_time, base_offset));
+                    sinks_guard.insert(instance_id, (id_clone.clone(), path_clone.clone(), Arc::clone(&sink), volume, name_clone.clone(), start_time, base_offset, levels.clone()));
                 }
                 
                 let duration_ms = duration.as_millis() as u64;
@@ -621,10 +803,10 @@ pub async fn play_sound(
                 loop {
                     let (current_sink, current_start_time, current_base_offset) = {
                         let sinks_guard = sinks.lock().unwrap();
-                        if let Some((_, _, s, _, _, st, bo)) = sinks_guard.get(&instance_id) {
+                        if let Some((_, _, s, _, _, st, bo, _)) = sinks_guard.get(&instance_id) {
                             (Arc::clone(s), *st, *bo)
                         } else {
-                            break; // Instance was stopped/removed
+                            break;
                         }
                     };
 
@@ -675,7 +857,7 @@ pub async fn play_sound(
                         }
                         
                         std::thread::sleep(Duration::from_millis(10));
-                        if let Some((_, _, final_sink, _, _, _, _)) = sinks_check.get(&instance_id) {
+                        if let Some((_, _, final_sink, _, _, _, _, _)) = sinks_check.get(&instance_id) {
                             if final_sink.empty() {
                                 break;
                             }
@@ -701,7 +883,7 @@ pub async fn play_sound(
 #[tauri::command]
 pub async fn toggle_pause_instance(state: State<'_, AudioState>, instance_id: u32) -> Result<bool, String> {
     let sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
-    if let Some((_, _, sink, _, _, _, _)) = sinks.get(&instance_id) {
+    if let Some((_, _, sink, _, _, _, _, _)) = sinks.get(&instance_id) {
         if sink.is_paused() {
             sink.play();
             Ok(false)
@@ -717,7 +899,7 @@ pub async fn toggle_pause_instance(state: State<'_, AudioState>, instance_id: u3
 #[tauri::command]
 pub async fn stop_instance(state: State<'_, AudioState>, instance_id: u32) -> Result<(), String> {
     let mut sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
-    if let Some((_, _, sink, _, _, _, _)) = sinks.remove(&instance_id) {
+    if let Some((_, _, sink, _, _, _, _, _)) = sinks.remove(&instance_id) {
         sink.stop();
     }
     Ok(())
@@ -728,7 +910,7 @@ pub async fn seek_instance(state: State<'_, AudioState>, instance_id: u32, posit
     let mut sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
     let master_vol = *state.master_volume.lock().unwrap();
 
-    if let Some((_, path, sink, volume, _, start_time, base_offset)) = sinks.get_mut(&instance_id) {
+    if let Some((_, path, sink, volume, _, start_time, base_offset, levels)) = sinks.get_mut(&instance_id) {
         let was_paused = sink.is_paused();
         sink.stop();
         
@@ -737,17 +919,17 @@ pub async fn seek_instance(state: State<'_, AudioState>, instance_id: u32, posit
             let new_sink = Arc::new(new_sink);
             
             if let Ok(source) = SymphoniaSource::new(path, Some(Duration::from_millis(position_ms))) {
-                let levels = Arc::new(Mutex::new(LevelData {
+                let new_levels = Arc::new(Mutex::new(LevelData {
                     peak: 0.0,
                     rms: 0.0,
                     volume: *volume,
                     last_update: Instant::now(),
                 }));
                 
-                let metered_source = LevelMeter::new(source, levels.clone());
+                let metered_source = LevelMeter::new(source, new_levels.clone());
                 new_sink.append(metered_source);
                 
-                state.meter_manager.add_meter(levels, Arc::clone(&new_sink));
+                state.meter_manager.add_meter(new_levels.clone(), Arc::clone(&new_sink));
                 
                 new_sink.set_volume(*volume * master_vol);
                 
@@ -758,6 +940,7 @@ pub async fn seek_instance(state: State<'_, AudioState>, instance_id: u32, posit
                 *sink = new_sink;
                 *start_time = std::time::Instant::now();
                 *base_offset = Duration::from_millis(position_ms);
+                *levels = new_levels;
             }
         }
     }
@@ -767,10 +950,28 @@ pub async fn seek_instance(state: State<'_, AudioState>, instance_id: u32, posit
 #[tauri::command]
 pub async fn stop_all(state: State<'_, AudioState>) -> Result<(), String> {
     let mut sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
-    for (_, (_, _, sink, _, _, _, _)) in sinks.iter() {
+    for (_, (_, _, sink, _, _, _, _, _)) in sinks.iter() {
         sink.stop();
     }
     sinks.clear();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_button_volume(state: State<'_, AudioState>, button_id: String, volume: f32) -> Result<(), String> {
+    let master_vol = *state.master_volume.lock().map_err(|_| "Failed to lock master volume")?;
+    let mut sinks = state.sinks.lock().map_err(|_| "Failed to lock sinks")?;
+    
+    for (_instance_id, (id, _, sink, stored_vol, _, _, _, levels)) in sinks.iter_mut() {
+        if *id == button_id {
+            *stored_vol = volume;
+            sink.set_volume(volume * master_vol);
+            if let Ok(mut levels_data) = levels.lock() {
+                levels_data.volume = volume;
+            }
+        }
+    }
+    
     Ok(())
 }
 

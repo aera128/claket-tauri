@@ -12,6 +12,7 @@ export interface SoundButton {
   color: string;
   isPaused: boolean;
   activeInstances: number;
+  shortcut: string | null;
 }
 
 export interface AudioProgress {
@@ -52,6 +53,7 @@ export const useAudioStore = defineStore("audio", {
     seekingInstanceId: null as number | null,
     seekRecovery: new Map<number, number>(),
     currentPage: 0,
+    pageDirection: "next" as "next" | "prev",
     itemsPerPage: 16,
     totalPages: 4,
     pageNames: [] as string[],
@@ -74,6 +76,11 @@ export const useAudioStore = defineStore("audio", {
     paginatedButtons: (state) => {
       const start = state.currentPage * state.itemsPerPage;
       return state.buttons.slice(start, start + state.itemsPerPage);
+    },
+    hasActiveSounds: (state) => state.activeProgresses.size > 0,
+    allPaused: (state) => {
+      if (state.activeProgresses.size === 0) return false;
+      return Array.from(state.activeProgresses.values()).every(p => p.is_paused);
     }
   },
   actions: {
@@ -89,6 +96,7 @@ export const useAudioStore = defineStore("audio", {
             color: "bg-secondary",
             isPaused: false,
             activeInstances: 0,
+            shortcut: null,
           });
         }
       }
@@ -102,6 +110,7 @@ export const useAudioStore = defineStore("audio", {
       await this.loadDevices();
       await this.loadSettings();
       this.setupListeners();
+      await this.registerAllShortcuts();
       this.isLoaded = true;
       this.preloadCurrentPage();
       this.applyAccentColor();
@@ -183,6 +192,14 @@ export const useAudioStore = defineStore("audio", {
               button.activeInstances--;
             }
             this.activeProgresses.delete(instanceId);
+        }
+      });
+
+      listen<number>("global-shortcut-triggered", (event) => {
+        const buttonId = event.payload;
+        const button = this.buttons.find(b => b.id === buttonId);
+        if (button && button.path) {
+          this.playSound(buttonId);
         }
       });
     },
@@ -290,9 +307,30 @@ export const useAudioStore = defineStore("audio", {
         console.error("Failed to stop all", e);
       }
     },
+
+    async togglePauseAll() {
+      if (this.activeProgresses.size === 0) return;
+      
+      const allPaused = Array.from(this.activeProgresses.values()).every(p => p.is_paused);
+      
+      for (const progress of this.activeProgresses.values()) {
+        if (allPaused) {
+          if (progress.is_paused) {
+            await this.togglePauseInstance(progress.instance_id);
+          }
+        } else {
+          if (!progress.is_paused) {
+            await this.togglePauseInstance(progress.instance_id);
+          }
+        }
+      }
+      
+      toast.success(allPaused ? "Resumed all sounds" : "Paused all sounds");
+    },
     
     setPage(page: number) {
       if (page >= 0 && page < this.totalPages) {
+        this.pageDirection = page > this.currentPage ? "next" : "prev";
         this.currentPage = page;
         this.preloadCurrentPage();
       }
@@ -300,6 +338,7 @@ export const useAudioStore = defineStore("audio", {
 
     nextPage() {
       if (this.currentPage < this.totalPages - 1) {
+        this.pageDirection = "next";
         this.currentPage++;
         this.preloadCurrentPage();
       }
@@ -307,6 +346,7 @@ export const useAudioStore = defineStore("audio", {
 
     prevPage() {
       if (this.currentPage > 0) {
+        this.pageDirection = "prev";
         this.currentPage--;
         this.preloadCurrentPage();
       }
@@ -333,6 +373,7 @@ export const useAudioStore = defineStore("audio", {
           color: "bg-secondary",
           isPaused: false,
           activeInstances: 0,
+          shortcut: null,
         });
       }
       
@@ -427,6 +468,11 @@ export const useAudioStore = defineStore("audio", {
       if (index !== -1) {
         const current = this.buttons[index];
         if (current) {
+          if (updates.volume !== undefined && updates.volume !== current.volume) {
+            invoke("update_button_volume", { buttonId: id.toString(), volume: updates.volume }).catch(e => {
+              console.error("Failed to update button volume", e);
+            });
+          }
           this.buttons[index] = {
             ...current,
             ...updates
@@ -470,7 +516,8 @@ export const useAudioStore = defineStore("audio", {
             path: b.path,
             name: b.name,
             volume: b.volume,
-            color: b.color
+            color: b.color,
+            shortcut: b.shortcut,
         }));
         await store.set("buttons", buttonsToSave);
         await store.set("masterVolume", this.masterVolume);
@@ -536,7 +583,8 @@ export const useAudioStore = defineStore("audio", {
             volume: saved?.volume ?? 0.5,
             color: saved?.color || "bg-secondary",
             isPaused: false,
-            activeInstances: 0
+            activeInstances: 0,
+            shortcut: saved?.shortcut || null,
           });
         }
         this.buttons = buttons;
@@ -554,6 +602,57 @@ export const useAudioStore = defineStore("audio", {
       } catch (e) {
         console.error("Failed to load settings", e);
       }
+    },
+
+    async registerAllShortcuts() {
+      for (const button of this.buttons) {
+        if (button.shortcut) {
+          try {
+            await invoke("register_global_shortcut", { 
+              shortcut: button.shortcut, 
+              buttonId: button.id 
+            });
+          } catch (e) {
+            console.warn(`Failed to register shortcut ${button.shortcut} for button ${button.id}:`, e);
+          }
+        }
+      }
+    },
+
+    async setButtonShortcut(buttonId: number, shortcut: string | null) {
+      const button = this.buttons.find(b => b.id === buttonId);
+      if (!button) return;
+
+      if (button.shortcut) {
+        try {
+          await invoke("unregister_global_shortcut", { shortcut: button.shortcut });
+        } catch (e) {
+          console.warn("Failed to unregister old shortcut:", e);
+        }
+      }
+
+      if (shortcut) {
+        try {
+          await invoke("register_global_shortcut", { 
+            shortcut, 
+            buttonId 
+          });
+          button.shortcut = shortcut;
+          toast.success(`Shortcut "${shortcut}" assigned`);
+        } catch (e) {
+          console.error("Failed to register shortcut:", e);
+          toast.error(`Failed to register shortcut "${shortcut}"`);
+          button.shortcut = null;
+        }
+      } else {
+        button.shortcut = null;
+      }
+
+      this.saveSettings();
+    },
+
+    async clearButtonShortcut(buttonId: number) {
+      await this.setButtonShortcut(buttonId, null);
     }
   },
 });

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useAudioStore } from "@/stores/audio";
 import {
   ContextMenu,
@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/context-menu";
 import { Slider } from "@/components/ui/slider";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Play, Pause, Square, Pencil, FolderOpen, RefreshCcw, Trash2 } from "lucide-vue-next";
+import { Play, Pause, Square, Pencil, FolderOpen, RefreshCcw, Keyboard } from "lucide-vue-next";
 import GlowingEffect from "@/components/ui/GlowingEffect.vue";
 import Input from "@/components/ui/Input.vue";
 import {
@@ -31,7 +31,10 @@ const props = defineProps<{
 const store = useAudioStore();
 const button = computed(() => store.buttons.find(b => b.id === props.id));
 const isRenameOpen = ref(false);
+const isShortcutOpen = ref(false);
 const newName = ref("");
+const capturedShortcut = ref<string | null>(null);
+const currentKeys = ref<string[]>([]);
 
 const openRename = () => {
   newName.value = button.value?.name || "";
@@ -44,6 +47,65 @@ const handleRename = () => {
   }
   isRenameOpen.value = false;
 };
+
+const openShortcutDialog = () => {
+  capturedShortcut.value = null;
+  currentKeys.value = [];
+  isShortcutOpen.value = true;
+};
+
+const handleKeyCapture = (e: KeyboardEvent) => {
+  if (!isShortcutOpen.value) return;
+  
+  e.preventDefault();
+  e.stopPropagation();
+  
+  const keys: string[] = [];
+  
+  if (e.ctrlKey) keys.push("Ctrl");
+  if (e.altKey) keys.push("Alt");
+  if (e.shiftKey) keys.push("Shift");
+  if (e.metaKey) keys.push("Super");
+  
+  if (e.key !== "Control" && e.key !== "Alt" && e.key !== "Shift" && e.key !== "Meta") {
+    const key = e.key.toUpperCase();
+    if (key === " ") keys.push("Space");
+    else if (key.length === 1) keys.push(key);
+    else if (["ARROWUP", "ARROWDOWN", "ARROWLEFT", "ARROWRIGHT"].includes(key)) {
+      keys.push(key.replace("ARROW", ""));
+    } else if (["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"].includes(key)) {
+      keys.push(key);
+    } else {
+      keys.push(key);
+    }
+  }
+  
+  currentKeys.value = keys;
+  
+  if (keys.length >= 2 && !["Control", "Alt", "Shift", "Super", "Meta"].includes(keys[keys.length - 1])) {
+    capturedShortcut.value = keys.join("+");
+  }
+};
+
+const handleSaveShortcut = async () => {
+  if (capturedShortcut.value) {
+    await store.setButtonShortcut(props.id, capturedShortcut.value);
+  }
+  isShortcutOpen.value = false;
+};
+
+const handleClearShortcut = async () => {
+  await store.clearButtonShortcut(props.id);
+  isShortcutOpen.value = false;
+};
+
+onMounted(() => {
+  window.addEventListener("keydown", handleKeyCapture);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("keydown", handleKeyCapture);
+});
 
 const handlePlay = async () => {
   if (!button.value?.path) {
@@ -83,7 +145,14 @@ const handleChooseFile = async () => {
       filters: [
         {
           name: "Audio",
-          extensions: ["mp3", "wav", "ogg", "flac", "m4a", "aac"]
+          extensions: [
+            "mp3", "mp2", "mp1",
+            "wav", "aiff",
+            "ogg", 
+            "flac",
+            "m4a", "mp4", "aac", "alac",
+            "webm", "mkv"
+          ]
         }
       ]
     });
@@ -162,6 +231,13 @@ const progressPercent = computed(() => {
              </button>
           </div>
 
+          <!-- Shortcut badge -->
+          <div v-if="button?.shortcut" class="absolute top-2 left-1/2 -translate-x-1/2 z-10">
+            <span class="text-[9px] font-mono bg-muted/90 px-1.5 py-0.5 rounded border border-border/50 shadow-sm">
+              {{ button.shortcut }}
+            </span>
+          </div>
+
           <div class="w-full h-full flex flex-col items-center justify-center p-4">
             <div v-if="button?.path" class="text-center p-4 w-full">
               <div class="font-bold truncate w-full text-lg mb-1 group-hover:text-primary transition-colors text-slate-950 dark:text-white">
@@ -203,6 +279,15 @@ const progressPercent = computed(() => {
       <ContextMenuItem @select="openRename" class="gap-2">
         <Pencil class="size-4 opacity-70" />
         Rename Sound...
+      </ContextMenuItem>
+      <ContextMenuItem @select="openShortcutDialog" class="gap-2">
+        <Keyboard class="size-4 opacity-70" />
+        <span v-if="button?.shortcut">Set Shortcut ({{ button.shortcut }})</span>
+        <span v-else>Set Shortcut...</span>
+      </ContextMenuItem>
+      <ContextMenuItem v-if="button?.shortcut" @select="handleClearShortcut" class="gap-2 text-muted-foreground">
+        <Keyboard class="size-4 opacity-70" />
+        Clear Shortcut
       </ContextMenuItem>
       <ContextMenuItem v-if="button?.activeInstances && button.activeInstances > 0" @select="handleTogglePause" class="gap-2">
         <template v-if="button.isPaused">
@@ -249,6 +334,38 @@ const progressPercent = computed(() => {
       <AlertDialogFooter>
         <AlertDialogCancel>Cancel</AlertDialogCancel>
         <AlertDialogAction @click="handleRename">Rename</AlertDialogAction>
+      </AlertDialogFooter>
+    </AlertDialogContent>
+  </AlertDialog>
+
+  <AlertDialog v-model:open="isShortcutOpen">
+    <AlertDialogContent>
+      <AlertDialogHeader>
+        <AlertDialogTitle>Set Global Shortcut</AlertDialogTitle>
+        <AlertDialogDescription>
+          Press a key combination (e.g., Ctrl+1, Alt+F1). The shortcut will work even when the app is minimized.
+        </AlertDialogDescription>
+      </AlertDialogHeader>
+      <div class="py-4">
+        <div class="h-16 flex items-center justify-center border-2 border-dashed rounded-lg bg-muted/50">
+          <span v-if="currentKeys.length > 0" class="text-lg font-mono font-bold">
+            {{ currentKeys.join(" + ") }}
+          </span>
+          <span v-else class="text-muted-foreground">Press keys...</span>
+        </div>
+        <p class="text-xs text-muted-foreground mt-2 text-center">
+          Requires at least one modifier (Ctrl, Alt, Shift)
+        </p>
+      </div>
+      <AlertDialogFooter>
+        <AlertDialogCancel>Cancel</AlertDialogCancel>
+        <AlertDialogAction 
+          @click="handleSaveShortcut" 
+          :disabled="!capturedShortcut"
+          :class="{ 'opacity-50 cursor-not-allowed': !capturedShortcut }"
+        >
+          Save Shortcut
+        </AlertDialogAction>
       </AlertDialogFooter>
     </AlertDialogContent>
   </AlertDialog>

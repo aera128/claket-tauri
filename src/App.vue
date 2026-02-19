@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, computed, ref, watch } from "vue";
 import { useAudioStore, ACCENT_COLORS } from "./stores/audio";
+import { useKeyboardShortcuts } from "./composables/useKeyboardShortcuts";
 import DeviceSelector from "./components/DeviceSelector.vue";
 import GlowButton from "./components/GlowButton.vue";
 import TitleBar from "./components/TitleBar.vue";
@@ -39,6 +40,8 @@ import logo from "@/assets/logo.png";
 const store = useAudioStore();
 const isDark = useDark();
 const toggleDark = useToggle(isDark);
+
+useKeyboardShortcuts();
 
 watch(isDark, (val) => {
   store.applyAccentColor(val);
@@ -343,13 +346,15 @@ const isSegmentActive = (index: number, total: number) => {
             </div>
           </div>
 
-          <div ref="gridRef" class="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <GlowButton 
-              v-for="btn in store.paginatedButtons" 
-              :key="btn.id" 
-              :id="btn.id" 
-            />
-          </div>
+          <Transition :name="store.pageDirection === 'next' ? 'page-next' : 'page-prev'" mode="out-in">
+            <div :key="store.currentPage" ref="gridRef" class="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <GlowButton 
+                v-for="btn in store.paginatedButtons" 
+                :key="btn.id" 
+                :id="btn.id" 
+              />
+            </div>
+          </Transition>
         </div>
       </ScrollArea>
 
@@ -474,10 +479,10 @@ const isSegmentActive = (index: number, total: number) => {
                 variant="default" 
                 size="icon" 
                 class="h-12 w-12 rounded-full shadow-md hover:scale-105 active:scale-95 transition-all duration-300"
-                @click="store.latestProgress && store.togglePauseInstance(store.latestProgress.instance_id)"
-                :disabled="!store.latestProgress"
+                @click="store.togglePauseAll"
+                :disabled="!store.hasActiveSounds"
               >
-                <Pause v-if="store.latestProgress && !store.latestProgress.is_paused" :size="24" fill="currentColor" />
+                <Pause v-if="store.hasActiveSounds && !store.allPaused" :size="24" fill="currentColor" />
                 <Play v-else :size="24" fill="currentColor" />
               </Button>
 
@@ -584,5 +589,37 @@ body {
 .slide-up-enter-from,
 .slide-up-leave-to {
   transform: translateY(100%);
+}
+
+/* Page navigation - next (slide left) */
+.page-next-enter-active,
+.page-next-leave-active {
+  transition: all 0.15s ease-out;
+}
+
+.page-next-enter-from {
+  opacity: 0;
+  transform: translateX(20px);
+}
+
+.page-next-leave-to {
+  opacity: 0;
+  transform: translateX(-20px);
+}
+
+/* Page navigation - prev (slide right) */
+.page-prev-enter-active,
+.page-prev-leave-active {
+  transition: all 0.15s ease-out;
+}
+
+.page-prev-enter-from {
+  opacity: 0;
+  transform: translateX(-20px);
+}
+
+.page-prev-leave-to {
+  opacity: 0;
+  transform: translateX(20px);
 }
 </style>
