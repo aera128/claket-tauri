@@ -519,7 +519,7 @@ const isSegmentActive = (index: number, total: number) => {
                                     <Button
                                         variant="ghost"
                                         size="icon"
-                                        class="rounded-full h-8 w-8 hover:bg-destructive/10 hover:text-destructive transition-colors"
+                                        class="rounded-full h-8 w-8 hover:bg-destructive/10 hover:text-destructive transition-colors text-primary/40"
                                         title="Delete Page"
                                     >
                                         <Trash2 :size="16" />
@@ -555,7 +555,7 @@ const isSegmentActive = (index: number, total: number) => {
                             <Button
                                 variant="ghost"
                                 size="icon"
-                                class="rounded-full h-8 w-8 hover:bg-primary/10 hover:text-primary transition-colors"
+                                class="rounded-full h-8 w-8 hover:bg-primary/10 hover:text-primary transition-colors text-primary/40"
                                 @click="store.addPage"
                                 title="Add Page"
                             >
