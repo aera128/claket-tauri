@@ -65,6 +65,7 @@ export const useAudioStore = defineStore("audio", {
     isVUMeterExpanded: false,
     titlebarStyle: "windows" as "windows" | "mac",
     controlsSide: "right" as "left" | "right",
+    isDarkMode: false,
   }),
   getters: {
     queueList: (state) => Array.from(state.activeProgresses.values()).reverse(),
@@ -528,6 +529,7 @@ export const useAudioStore = defineStore("audio", {
         await store.set("accentColor", this.accentColor);
         await store.set("titlebarStyle", this.titlebarStyle);
         await store.set("controlsSide", this.controlsSide);
+        await store.set("isDarkMode", this.isDarkMode);
         await store.save();
       } catch (e) {
         console.error("Failed to save settings", e);
@@ -544,6 +546,7 @@ export const useAudioStore = defineStore("audio", {
         const savedAccentColor = await store.get<string>("accentColor");
         const savedTitlebarStyle = await store.get<string>("titlebarStyle");
         const savedControlsSide = await store.get<string>("controlsSide");
+        const savedIsDarkMode = await store.get<boolean>("isDarkMode");
         
         if (savedTotalPages) {
           this.totalPages = savedTotalPages;
@@ -569,6 +572,10 @@ export const useAudioStore = defineStore("audio", {
 
         if (savedControlsSide === "left" || savedControlsSide === "right") {
           this.controlsSide = savedControlsSide;
+        }
+
+        if (savedIsDarkMode !== null && savedIsDarkMode !== undefined) {
+          this.isDarkMode = savedIsDarkMode;
         }
 
         const totalButtons = this.itemsPerPage * this.totalPages;
